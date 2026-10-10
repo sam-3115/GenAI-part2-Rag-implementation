@@ -1,75 +1,92 @@
-from dotenv import load_dotenv
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain_mistralai import ChatMistralAI
-from langchain_core.prompts import ChatPromptTemplate
 
-load_dotenv()
-
-embedding_model = OpenAIEmbeddings()
-
-vectorstore = Chroma(
-    persist_directory= "chroma_db",
-    embedding_function=embedding_model
-)
-
-retriever = vectorstore.as_retriever(
-    search_type = "mmr",
-    search_kwargs = {
-        "k" : 4,
-        "fetch_k":10,
-        "lambda_mult" :0.5
-    }
-)
-
-llm = ChatMistralAI(model = "mistral-small-2506")
-
-#prompt template 
-prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            """You are a helpful AI assistant.
-
-Use ONLY the provided context to answer the question.
-
-If the answer is not present in the context,
-say: "I could not find the answer in the document."
 """
-        ),
-        (
-            "human",
-            """Context:
-{context}
+FastAPI service for a RAG-based Document Q&A API.
 
-Question:
-{question}
+Endpoints:
+  POST /upload       -> accepts raw text and builds a vector index
+  POST /upload-file  -> accepts a .txt file and builds a vector index
+  POST /query        -> accepts a doc_id + question, returns an answer + source chunks
+  GET  /health       -> simple health check
+
+Run locally:
+  uvicorn app.main:app --reload
+
+Then open http://127.0.0.1:8000/docs for interactive Swagger UI.
 """
-        )
-    ]
+
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from pydantic import BaseModel, Field
+from app import rag
+
+app = FastAPI(
+    title="RAG Document Q&A API",
+    description="Upload a document, then ask grounded questions about it using retrieval-augmented generation.",
+    version="1.0.0",
 )
 
-print("Rag system created ")
 
-print("press 0 to exit ")
+class UploadTextRequest(BaseModel):
+    text: str = Field(..., min_length=1, description="Raw document text to ingest")
 
-while True:
-    query = input("You : ")
-    if query == "0":
-        break 
-    
-    docs = retriever.invoke(query)
 
-    context = "\n\n".join(
-        [doc.page_content for doc in docs]
+class UploadResponse(BaseModel):
+    doc_id: str
+    num_chunks: int
+
+
+class QueryRequest(BaseModel):
+    doc_id: str = Field(..., description="doc_id returned by /upload")
+    question: str = Field(..., min_length=1)
+    top_k: int = Field(default=3, ge=1, le=10)
+
+
+class SourceChunk(BaseModel):
+    text: str
+    score: float
+
+
+class QueryResponse(BaseModel):
+    answer: str
+    sources: list[SourceChunk]
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/upload", response_model=UploadResponse)
+def upload_text(payload: UploadTextRequest):
+    """Ingest raw text directly (useful for testing without a file)."""
+    doc_id = rag.ingest_document(payload.text)
+    store = rag.get_store(doc_id)
+    return UploadResponse(doc_id=doc_id, num_chunks=len(store.chunks))
+
+
+@app.post("/upload-file", response_model=UploadResponse)
+async def upload_file(file: UploadFile = File(...)):
+    """Ingest a .txt file upload."""
+    if not file.filename.endswith(".txt"):
+        raise HTTPException(status_code=400, detail="Only .txt files are supported in this demo.")
+
+    raw_bytes = await file.read()
+    text = raw_bytes.decode("utf-8", errors="ignore")
+    doc_id = rag.ingest_document(text)
+    store = rag.get_store(doc_id)
+    return UploadResponse(doc_id=doc_id, num_chunks=len(store.chunks))
+
+
+@app.post("/query", response_model=QueryResponse)
+def query(payload: QueryRequest):
+    try:
+        result = rag.answer_question(payload.doc_id, payload.question, k=payload.top_k)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        # e.g. missing GEMINI_API_KEY
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return QueryResponse(
+        answer=result["answer"],
+        sources=[SourceChunk(**s) for s in result["sources"]],
     )
-    
-    final_prompt = prompt.invoke({
-        "context" :context,
-        "question": query
-    })
-    
-    response = llm.invoke(final_prompt)
-
-    print(f"\n AI: {response.content}")
-    
